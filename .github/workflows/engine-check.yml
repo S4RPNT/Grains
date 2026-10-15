@@ -1,0 +1,96 @@
+name: Engine check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install silvergrain (CPU)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install silvergrain pillow numpy
+          mkdir -p report
+          pip show silvergrain > report/silvergrain_version.txt 2>&1
+
+      - name: Collect sources of all three implementations
+        continue-on-error: true
+        shell: bash
+        run: |
+          SG=$(python -c "import silvergrain, os; print(os.path.dirname(silvergrain.__file__))")
+          cp -r "$SG" report/silvergrain_src
+          git clone --depth 1 https://github.com/alasdairnewson/film_grain_rendering.git ipol_cpu
+          git clone --depth 1 https://github.com/alasdairnewson/film_grain_rendering_gpu.git ipol_gpu_repo
+          rm -rf ipol_cpu/.git ipol_gpu_repo/.git
+          cp -r ipol_cpu report/ipol_cpu
+          cp -r ipol_gpu_repo report/ipol_gpu_repo
+
+      - name: Probe silvergrain API and CPU speed
+        continue-on-error: true
+        shell: bash
+        run: |
+          python - <<'PY' > report/silvergrain_probe.txt 2>&1
+          import time, inspect
+          import numpy as np
+          from PIL import Image
+          import silvergrain
+          from silvergrain import FilmGrainRenderer as R
+          print('module:', silvergrain.__file__)
+          print('public names:', [n for n in dir(silvergrain) if not n.startswith('_')])
+          print('init signature:', inspect.signature(R.__init__))
+          for n in dir(R):
+              if not n.startswith('_'):
+                  try:
+                      print('method', n, inspect.signature(getattr(R, n)))
+                  except Exception as e:
+                      print('method', n, 'no signature:', e)
+          w = h = 256
+          x = np.tile(np.linspace(0, 255, w).astype(np.uint8), (h, 1))
+          img = Image.fromarray(np.stack([x, x, x], axis=2))
+          r = R(grain_radius=0.12, n_monte_carlo=100, device='cpu')
+          for i in range(2):
+              t = time.time()
+              out = r.render(img)
+              print('render run', i, round(time.time() - t, 2), 's', type(out), getattr(out, 'mode', None), getattr(out, 'size', None))
+          out.save('report/bench_out.png')
+          out2 = r.render(img)
+          print('same input twice identical:', bool((np.asarray(out) == np.asarray(out2)).all()))
+          try:
+              img16 = Image.fromarray(x.astype(np.uint16) * 257)
+              o16 = r.render(img16)
+              print('16-bit input ->', o16.mode, np.asarray(o16).dtype)
+          except Exception as e:
+              print('16-bit input failed:', repr(e))
+          PY
+
+      - name: Freeze test (can the engine run inside an EXE?)
+        continue-on-error: true
+        shell: bash
+        run: |
+          pip install pyinstaller
+          cat > freeze_test.py <<'PY'
+          import numpy as np
+          from PIL import Image
+          from silvergrain import FilmGrainRenderer
+          x = np.tile(np.linspace(0, 255, 64).astype(np.uint8), (64, 1))
+          img = Image.fromarray(np.stack([x, x, x], axis=2))
+          out = FilmGrainRenderer(grain_radius=0.12, n_monte_carlo=20, device='cpu').render(img)
+          print('FREEZE TEST OK', out.size, out.mode)
+          PY
+          pyinstaller --noconfirm --onedir --collect-all silvergrain --collect-all numba --collect-all llvmlite freeze_test.py > report/freeze_build.log 2>&1
+          dist/freeze_test/freeze_test.exe > report/freeze_run.txt 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-report
+          path: report
